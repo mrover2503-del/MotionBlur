@@ -37,7 +37,8 @@ uniform float uBlendFactor;
 void main() {
     vec4 current = texture2D(uCurrentFrame, vTexCoord);
     vec4 history = texture2D(uHistoryFrame, vTexCoord);
-    gl_FragColor = mix(current, history, uBlendFactor);
+    vec4 result = mix(current, history, uBlendFactor);
+    gl_FragColor = vec4(result.rgb, 1.0);
 }
 )";
 
@@ -46,7 +47,8 @@ precision mediump float;
 varying vec2 vTexCoord;
 uniform sampler2D uTexture;
 void main() {
-    gl_FragColor = texture2D(uTexture, vTexCoord);
+    vec4 color = texture2D(uTexture, vTexCoord);
+    gl_FragColor = vec4(color.rgb, 1.0);
 }
 )";
 
@@ -57,6 +59,7 @@ static GLuint rawTexture = 0;
 static GLuint historyTextures[2] = {0, 0};
 static GLuint historyFBOs[2] = {0, 0};
 static int pingPongIndex = 0;
+static bool isFirstFrame = true;
 
 static GLuint blendShaderProgram = 0;
 static GLint blendPosLoc = -1;
@@ -116,7 +119,12 @@ void initializeMotionBlurResources(GLint width, GLint height) {
         drawTexCoordLoc = glGetAttribLocation(drawShaderProgram, "aTexCoord");
         drawTextureLoc = glGetUniformLocation(drawShaderProgram, "uTexture");
 
-        GLfloat vertices[] = { -1.0f, 1.0f, 0.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+        GLfloat vertices[] = { 
+            -1.0f, 1.0f, 0.0f, 1.0f, 
+            -1.0f, -1.0f, 0.0f, 0.0f, 
+            1.0f, -1.0f, 1.0f, 0.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f 
+        };
         GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
 
         glGenBuffers(1, &vertexBuffer);
@@ -149,7 +157,7 @@ void initializeMotionBlurResources(GLint width, GLint height) {
         
         glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[i]);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, historyTextures[i], 0);
-        glClearColor(0, 0, 0, 0);
+        glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
     }
 
@@ -159,6 +167,7 @@ void initializeMotionBlurResources(GLint width, GLint height) {
     blur_res_width = width;
     blur_res_height = height;
     pingPongIndex = 0;
+    isFirstFrame = true;
 }
 
 void apply_motion_blur(int width, int height) {
@@ -166,37 +175,63 @@ void apply_motion_blur(int width, int height) {
         initializeMotionBlurResources(width, height);
     }
 
-    int curr = pingPongIndex;
-    int prev = 1 - pingPongIndex;
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
 
     glBindTexture(GL_TEXTURE_2D, rawTexture);
     glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, width, height, 0);
 
-    glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[curr]);
-    glViewport(0, 0, width, height);
-    glClear(GL_COLOR_BUFFER_BIT);
+    int curr = pingPongIndex;
+    int prev = 1 - pingPongIndex;
 
-    glUseProgram(blendShaderProgram);
+    if (isFirstFrame) {
+        glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[curr]);
+        glViewport(0, 0, width, height);
+        
+        glUseProgram(drawShaderProgram);
+        
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, rawTexture);
+        glUniform1i(drawTextureLoc, 0);
+        
+        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
+        
+        glEnableVertexAttribArray(drawPosLoc);
+        glVertexAttribPointer(drawPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
+        glEnableVertexAttribArray(drawTexCoordLoc);
+        glVertexAttribPointer(drawTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
+        
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+        
+        isFirstFrame = false;
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[curr]);
+        glViewport(0, 0, width, height);
+        
+        glUseProgram(blendShaderProgram);
 
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, rawTexture);
-    glUniform1i(blendCurrentLoc, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, rawTexture);
+        glUniform1i(blendCurrentLoc, 0);
 
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, historyTextures[prev]);
-    glUniform1i(blendHistoryLoc, 1);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, historyTextures[prev]);
+        glUniform1i(blendHistoryLoc, 1);
 
-    glUniform1f(blendFactorLoc, blur_strength);
+        glUniform1f(blendFactorLoc, blur_strength);
 
-    glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
+        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
 
-    glEnableVertexAttribArray(blendPosLoc);
-    glVertexAttribPointer(blendPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
-    glEnableVertexAttribArray(blendTexCoordLoc);
-    glVertexAttribPointer(blendTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
+        glEnableVertexAttribArray(blendPosLoc);
+        glVertexAttribPointer(blendPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
+        glEnableVertexAttribArray(blendTexCoordLoc);
+        glVertexAttribPointer(blendTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
 
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+    }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, width, height);
@@ -207,6 +242,9 @@ void apply_motion_blur(int width, int height) {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, historyTextures[curr]);
     glUniform1i(drawTextureLoc, 0);
+
+    glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
 
     glEnableVertexAttribArray(drawPosLoc);
     glVertexAttribPointer(drawPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
@@ -278,6 +316,9 @@ static void render() {
     GLint last_element_array_buffer; glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &last_element_array_buffer);
     GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
     GLint last_viewport[4]; glGetIntegerv(GL_VIEWPORT, last_viewport);
+    GLboolean last_scissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean last_depth = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean last_blend = glIsEnabled(GL_BLEND);
 
     if (motion_blur_enabled) {
         apply_motion_blur(g_width, g_height);
@@ -300,6 +341,9 @@ static void render() {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, last_element_array_buffer);
     glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
     glViewport(last_viewport[0], last_viewport[1], last_viewport[2], last_viewport[3]);
+    if (last_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (last_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (last_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
 }
 
 static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
