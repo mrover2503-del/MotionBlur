@@ -10,6 +10,7 @@
 #include <string.h>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
@@ -261,25 +262,31 @@ static int g_width = 0, g_height = 0;
 static EGLContext g_targetcontext = EGL_NO_CONTEXT;
 static EGLSurface g_targetsurface = EGL_NO_SURFACE;
 static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
-static void (*orig_input1)(void*, void*, void*) = nullptr;
-static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
 
-static void hook_input1(void* thiz, void* a1, void* a2) {
-    if (orig_input1) orig_input1(thiz, a1, a2);
-    if (thiz && g_initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
-}
-
-static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
-    int32_t result = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
-    if (result == 0 && event && *event && g_initialized) ImGui_ImplAndroid_HandleInputEvent(*event);
-    return result;
-}
+struct WindowBounds {
+    float x, y, w, h;
+    bool visible;
+};
+static WindowBounds g_menuBounds = {0, 0, 0, 0, false};
+static std::mutex g_boundsMutex;
 
 static void drawmenu() {
     ImGui::SetNextWindowPos(ImVec2(10, 80), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(350, 180), ImGuiCond_FirstUseEver);
 
     ImGui::Begin("Natural Motion Blur", nullptr);
+    
+    {
+        std::lock_guard<std::mutex> lock(g_boundsMutex);
+        ImVec2 pos = ImGui::GetWindowPos();
+        ImVec2 size = ImGui::GetWindowSize();
+        g_menuBounds.x = pos.x;
+        g_menuBounds.y = pos.y;
+        g_menuBounds.w = size.x;
+        g_menuBounds.h = size.y;
+        g_menuBounds.visible = true;
+    }
+
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(16, 12));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
     ImGui::SetWindowFontScale(1.2f);
@@ -366,9 +373,38 @@ static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     return orig_eglswapbuffers(dpy, surf);
 }
 
-static void hookinput() {
-    void* sym = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
-    if (sym) GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
+typedef bool (*PreloaderInput_OnTouch_Fn)(int action, int pointerId, float x, float y);
+
+struct PreloaderInput_Interface {
+    void (*RegisterTouchCallback)(PreloaderInput_OnTouch_Fn callback);
+};
+
+typedef PreloaderInput_Interface* (*GetPreloaderInput_Fn)();
+
+bool OnTouchCallback(int action, int pointerId, float x, float y) {
+    if (!g_initialized) return false;
+    
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(x, y);
+    
+    if (action == AMOTION_EVENT_ACTION_DOWN) {
+        io.AddMouseButtonEvent(0, true);
+    } else if (action == AMOTION_EVENT_ACTION_UP) {
+        io.AddMouseButtonEvent(0, false);
+    }
+    
+    bool hitTest = false;
+    {
+        std::lock_guard<std::mutex> lock(g_boundsMutex);
+        if (g_menuBounds.visible) {
+            if (x >= g_menuBounds.x && x <= (g_menuBounds.x + g_menuBounds.w) &&
+                y >= g_menuBounds.y && y <= (g_menuBounds.y + g_menuBounds.h)) {
+                hitTest = true;
+            }
+        }
+    }
+    
+    return hitTest || io.WantCaptureMouse;
 }
 
 static void* mainthread(void*) {
@@ -381,7 +417,22 @@ static void* mainthread(void*) {
         if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
     }
 
-    hookinput();
+    void* preloaderLib = dlopen("libpreloader.so", RTLD_NOW);
+    if (preloaderLib) {
+        GetPreloaderInput_Fn GetInput = (GetPreloaderInput_Fn)dlsym(preloaderLib, "GetPreloaderInput");
+        if (GetInput) {
+            PreloaderInput_Interface* input = GetInput();
+            if (input && input->RegisterTouchCallback) {
+                input->RegisterTouchCallback(OnTouchCallback);
+                __android_log_print(ANDROID_LOG_INFO, "MotionBlur", "Successfully registered with PreloaderInput");
+            }
+        } else {
+            __android_log_print(ANDROID_LOG_ERROR, "MotionBlur", "Failed to find GetPreloaderInput symbol");
+        }
+    } else {
+        __android_log_print(ANDROID_LOG_ERROR, "MotionBlur", "Failed to load libpreloader.so: %s", dlerror());
+    }
+
     return nullptr;
 }
 
