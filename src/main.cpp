@@ -272,7 +272,7 @@ static std::mutex g_boundsMutex;
 
 
 
-void DrawCustomMenu() {
+void DrawMenu() {
     static bool show_menu = false;
     static bool motion_blur_enabled = true;
     static int current_tab = 0;
