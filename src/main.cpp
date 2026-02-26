@@ -30,7 +30,7 @@ void main() {
 )";
 
 const char* blendFragmentShaderSource = R"(
-precision mediump float;
+precision highp float;
 varying vec2 vTexCoord;
 uniform sampler2D uCurrentFrame;
 uniform sampler2D uHistoryFrame;
@@ -44,7 +44,7 @@ void main() {
 )";
 
 const char* drawFragmentShaderSource = R"(
-precision mediump float;
+precision highp float;
 varying vec2 vTexCoord;
 uniform sampler2D uTexture;
 void main() {
@@ -317,8 +317,14 @@ static void setup() {
 static void render() {
     if (!g_initialized) return;
 
+    GLint last_active_texture; glGetIntegerv(GL_ACTIVE_TEXTURE, &last_active_texture);
+    glActiveTexture(GL_TEXTURE0);
+    GLint last_tex0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex0);
+    glActiveTexture(GL_TEXTURE1);
+    GLint last_tex1; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex1);
+    glActiveTexture(last_active_texture);
+
     GLint last_prog; glGetIntegerv(GL_CURRENT_PROGRAM, &last_prog);
-    GLint last_tex; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex);
     GLint last_array_buffer; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &last_array_buffer);
     GLint last_element_array_buffer; glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &last_element_array_buffer);
     GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
@@ -343,7 +349,13 @@ static void render() {
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
     glUseProgram(last_prog);
-    glBindTexture(GL_TEXTURE_2D, last_tex);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, last_tex0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, last_tex1);
+    glActiveTexture(last_active_texture);
+
     glBindBuffer(GL_ARRAY_BUFFER, last_array_buffer);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, last_element_array_buffer);
     glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
@@ -351,6 +363,11 @@ static void render() {
     if (last_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
     if (last_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (last_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+
+    if (blendPosLoc >= 0) glDisableVertexAttribArray(blendPosLoc);
+    if (blendTexCoordLoc >= 0) glDisableVertexAttribArray(blendTexCoordLoc);
+    if (drawPosLoc >= 0) glDisableVertexAttribArray(drawPosLoc);
+    if (drawTexCoordLoc >= 0) glDisableVertexAttribArray(drawTexCoordLoc);
 }
 
 static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
@@ -424,13 +441,8 @@ static void* mainthread(void*) {
             PreloaderInput_Interface* input = GetInput();
             if (input && input->RegisterTouchCallback) {
                 input->RegisterTouchCallback(OnTouchCallback);
-                __android_log_print(ANDROID_LOG_INFO, "MotionBlur", "Successfully registered with PreloaderInput");
             }
-        } else {
-            __android_log_print(ANDROID_LOG_ERROR, "MotionBlur", "Failed to find GetPreloaderInput symbol");
         }
-    } else {
-        __android_log_print(ANDROID_LOG_ERROR, "MotionBlur", "Failed to load libpreloader.so: %s", dlerror());
     }
 
     return nullptr;
