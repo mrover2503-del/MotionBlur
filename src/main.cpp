@@ -10,7 +10,6 @@
 #include <string>
 #include <stdio.h>
 
-// PreLoader 대신 표준 후킹 라이브러리인 Dobby 사용
 #include <dobby.h>
 
 #include "ImGui/imgui.h"
@@ -25,17 +24,15 @@ static EGLSurface g_targetsurface = EGL_NO_SURFACE;
 
 static bool show_menu = false;
 static bool my_checkbox_state = false;
-static bool last_checkbox_state = false; // 상태 변화 감지용
+static bool last_checkbox_state = false; 
 
 // --- 마인크래프트 오프셋 관련 변수 ---
 uintptr_t mcpe_base = 0;
 void* g_localPlayer = nullptr;
 
-// 함수 포인터 원형 선언
 void (*displayClientMessage)(void* _this, const std::string& msg) = nullptr;
 void (*orig_normalTick)(void* _this) = nullptr;
 
-// --- 라이브러리 베이스 주소 구하기 ---
 uintptr_t get_lib_base(const char* lib_name) {
     FILE* fp = fopen("/proc/self/maps", "rt");
     if (!fp) return 0;
@@ -43,7 +40,6 @@ uintptr_t get_lib_base(const char* lib_name) {
     uintptr_t base = 0;
     while (fgets(line, sizeof(line), fp)) {
         if (strstr(line, lib_name)) {
-            // 실행 가능한 권한(r-xp)이 있는 메모리 영역을 주로 베이스로 잡습니다.
             if (strstr(line, "r-xp") || strstr(line, "r--p")) {
                 sscanf(line, "%lx-", &base);
                 break;
@@ -54,19 +50,16 @@ uintptr_t get_lib_base(const char* lib_name) {
     return base;
 }
 
-// --- LocalPlayer::normalTick 후킹 함수 ---
 void hook_normalTick(void* _this) {
-    g_localPlayer = _this; // 플레이어 포인터 캡처
+    g_localPlayer = _this; 
     if (orig_normalTick) {
-        orig_normalTick(_this); // 원본 함수 실행
+        orig_normalTick(_this); 
     }
 }
 
-// --- 원본 함수 포인터 (EGL & Input) ---
 static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
 static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
 
-// --- 입력 후킹 (ImGui 터치 처리) ---
 static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
     int32_t result = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
     if (result == 0 && event && *event && g_initialized) {
@@ -85,7 +78,6 @@ static void hookinput() {
     }
 }
 
-// --- ImGui UI 그리기 ---
 static void draw_toggle_button() {
     ImGui::SetNextWindowPos(ImVec2(50.0f, 50.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.5f);
@@ -105,30 +97,25 @@ static void draw_menu() {
     ImGui::Begin("Araxis Client", &show_menu, ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::SetWindowFontScale(2.0f);
 
-    // 체크박스 렌더링
     ImGui::Checkbox("Test Module", &my_checkbox_state);
     
-    // --- 체크박스 상태가 변했을 때의 로직 ---
     if (my_checkbox_state != last_checkbox_state) {
-        last_checkbox_state = my_checkbox_state; // 상태 업데이트
+        last_checkbox_state = my_checkbox_state; 
 
-        // 플레이어가 월드에 접속해 있고, 함수가 정상적으로 바인딩 되었는지 확인
         if (g_localPlayer != nullptr && displayClientMessage != nullptr) {
             std::string msg;
             if (my_checkbox_state) {
-                msg = "§a[Araxis] Test Module ON!"; // 초록색 텍스트
+                msg = "\xC2\xA7\x61[Araxis] Test Module ON!"; // 초록색 텍스트
             } else {
-                msg = "§c[Araxis] Test Module OFF!"; // 빨간색 텍스트
+                msg = "\xC2\xA7\x63[Araxis] Test Module OFF!"; // 빨간색 텍스트
             }
             
-            // 캡처해둔 플레이어 포인터를 이용해 채팅창에 메시지 출력
             displayClientMessage(g_localPlayer, msg);
         }
     }
 
     ImGui::Separator();
 
-    // 메뉴 내부 텍스트 표시
     if (my_checkbox_state) {
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "ON!");
     } else {
@@ -138,7 +125,6 @@ static void draw_menu() {
     ImGui::End();
 }
 
-// --- ImGui 초기화 및 렌더링 루프 ---
 static void setup() {
     if (g_initialized || g_width <= 0) return;
     ImGui::CreateContext();
@@ -182,7 +168,6 @@ static void render() {
     if (last_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
 }
 
-// --- EGL 후킹 ---
 static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     if (!orig_eglswapbuffers) return EGL_FALSE;
     EGLContext ctx = eglGetCurrentContext();
@@ -208,22 +193,20 @@ static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     return orig_eglswapbuffers(dpy, surf);
 }
 
-// --- 메인 쓰레드 초기화 ---
 static void* mainthread(void*) {
-    // 라이브러리가 메모리에 확실히 올라올 때까지 대기
+    // 마인크래프트 라이브러리가 완전히 로드될 때까지 대기
     while (mcpe_base == 0) {
         mcpe_base = get_lib_base("libminecraftpe.so");
         if (mcpe_base == 0) sleep(1);
     }
     
-    // 1. displayClientMessage 오프셋 바인딩 (0xA6B2C60)
+    // 1. 함수 바인딩
     displayClientMessage = (void(*)(void*, const std::string&))(mcpe_base + 0xA6B2C60);
 
-    // 2. LocalPlayer::normalTick 후킹 (0xEC4E028)
+    // 2. DobbyHook 실행
     void* tick_target = (void*)(mcpe_base + 0xEC4E028);
     DobbyHook(tick_target, (void*)hook_normalTick, (void**)&orig_normalTick);
 
-    // 3. EGL 후킹 (화면 렌더링)
     void* hEGL = dlopen("libEGL.so", RTLD_LAZY);
     if (hEGL) {
         void* swap = dlsym(hEGL, "eglSwapBuffers");
@@ -232,13 +215,11 @@ static void* mainthread(void*) {
         }
     }
 
-    // 4. 입력 장치 후킹 (터치)
     hookinput(); 
     
     return nullptr;
 }
 
-// --- 생성자 진입점 ---
 __attribute__((constructor))
 void display_init() {
     pthread_t t;
