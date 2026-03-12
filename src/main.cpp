@@ -7,478 +7,200 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <dlfcn.h>
-#include <string.h>
-#include <vector>
-#include <algorithm>
-#include <mutex>
+#include <string>
+#include <stdio.h>
 
-#include "pl/Hook.h"
-#include "pl/Gloss.h"
+// PreLoader 대신 표준 후킹 라이브러리인 Dobby 사용
+#include <dobby.h>
 
 #include "ImGui/imgui.h"
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
 
-const char* vertexShaderSource = R"(
-attribute vec4 aPosition;
-attribute vec2 aTexCoord;
-varying vec2 vTexCoord;
-void main() {
-    gl_Position = aPosition;
-    vTexCoord = aTexCoord;
-}
-)";
-
-const char* blendFragmentShaderSource = R"(
-precision highp float;
-varying vec2 vTexCoord;
-uniform sampler2D uCurrentFrame;
-uniform sampler2D uHistoryFrame;
-uniform float uBlendFactor;
-void main() {
-    vec4 current = texture2D(uCurrentFrame, vTexCoord);
-    vec4 history = texture2D(uHistoryFrame, vTexCoord);
-    vec4 result = mix(current, history, uBlendFactor);
-    gl_FragColor = vec4(result.rgb, 1.0);
-}
-)";
-
-const char* drawFragmentShaderSource = R"(
-precision highp float;
-varying vec2 vTexCoord;
-uniform sampler2D uTexture;
-void main() {
-    vec4 color = texture2D(uTexture, vTexCoord);
-    gl_FragColor = vec4(color.rgb, 1.0);
-}
-)";
-
-static bool motion_blur_enabled = false;
-static float blur_strength = 0.85f;
-
-static GLuint rawTexture = 0;
-static GLuint historyTextures[2] = {0, 0};
-static GLuint historyFBOs[2] = {0, 0};
-static int pingPongIndex = 0;
-static bool isFirstFrame = true;
-
-static GLuint blendShaderProgram = 0;
-static GLint blendPosLoc = -1;
-static GLint blendTexCoordLoc = -1;
-static GLint blendCurrentLoc = -1;
-static GLint blendHistoryLoc = -1;
-static GLint blendFactorLoc = -1;
-
-static GLuint drawShaderProgram = 0;
-static GLint drawPosLoc = -1;
-static GLint drawTexCoordLoc = -1;
-static GLint drawTextureLoc = -1;
-
-static GLuint vertexBuffer = 0;
-static GLuint indexBuffer = 0;
-
-static int blur_res_width = 0;
-static int blur_res_height = 0;
-
-void initializeMotionBlurResources(GLint width, GLint height) {
-    if (rawTexture != 0) {
-        glDeleteTextures(1, &rawTexture);
-        glDeleteTextures(2, historyTextures);
-        glDeleteFramebuffers(2, historyFBOs);
-    }
-
-    if (blendShaderProgram == 0) {
-        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
-        glShaderSource(vs, 1, &vertexShaderSource, nullptr);
-        glCompileShader(vs);
-
-        GLuint fsBlend = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fsBlend, 1, &blendFragmentShaderSource, nullptr);
-        glCompileShader(fsBlend);
-
-        blendShaderProgram = glCreateProgram();
-        glAttachShader(blendShaderProgram, vs);
-        glAttachShader(blendShaderProgram, fsBlend);
-        glLinkProgram(blendShaderProgram);
-
-        blendPosLoc = glGetAttribLocation(blendShaderProgram, "aPosition");
-        blendTexCoordLoc = glGetAttribLocation(blendShaderProgram, "aTexCoord");
-        blendCurrentLoc = glGetUniformLocation(blendShaderProgram, "uCurrentFrame");
-        blendHistoryLoc = glGetUniformLocation(blendShaderProgram, "uHistoryFrame");
-        blendFactorLoc = glGetUniformLocation(blendShaderProgram, "uBlendFactor");
-
-        GLuint fsDraw = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fsDraw, 1, &drawFragmentShaderSource, nullptr);
-        glCompileShader(fsDraw);
-
-        drawShaderProgram = glCreateProgram();
-        glAttachShader(drawShaderProgram, vs);
-        glAttachShader(drawShaderProgram, fsDraw);
-        glLinkProgram(drawShaderProgram);
-
-        drawPosLoc = glGetAttribLocation(drawShaderProgram, "aPosition");
-        drawTexCoordLoc = glGetAttribLocation(drawShaderProgram, "aTexCoord");
-        drawTextureLoc = glGetUniformLocation(drawShaderProgram, "uTexture");
-
-        GLfloat vertices[] = { 
-            -1.0f, 1.0f, 0.0f, 1.0f, 
-            -1.0f, -1.0f, 0.0f, 0.0f, 
-            1.0f, -1.0f, 1.0f, 0.0f, 
-            1.0f, 1.0f, 1.0f, 1.0f 
-        };
-        GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
-
-        glGenBuffers(1, &vertexBuffer);
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-
-        glGenBuffers(1, &indexBuffer);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-    }
-
-    glGenTextures(1, &rawTexture);
-    glBindTexture(GL_TEXTURE_2D, rawTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    glGenTextures(2, historyTextures);
-    glGenFramebuffers(2, historyFBOs);
-
-    for (int i = 0; i < 2; i++) {
-        glBindTexture(GL_TEXTURE_2D, historyTextures[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        
-        glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[i]);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, historyTextures[i], 0);
-        glClearColor(0, 0, 0, 1);
-        glClear(GL_COLOR_BUFFER_BIT);
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    blur_res_width = width;
-    blur_res_height = height;
-    pingPongIndex = 0;
-    isFirstFrame = true;
-}
-
-void apply_motion_blur(int width, int height) {
-    if (width != blur_res_width || height != blur_res_height || rawTexture == 0) {
-        initializeMotionBlurResources(width, height);
-    }
-
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-
-    glBindTexture(GL_TEXTURE_2D, rawTexture);
-    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, width, height, 0);
-
-    int curr = pingPongIndex;
-    int prev = 1 - pingPongIndex;
-
-    if (isFirstFrame) {
-        glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[curr]);
-        glViewport(0, 0, width, height);
-        
-        glUseProgram(drawShaderProgram);
-        
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, rawTexture);
-        glUniform1i(drawTextureLoc, 0);
-        
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-        
-        glEnableVertexAttribArray(drawPosLoc);
-        glVertexAttribPointer(drawPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
-        glEnableVertexAttribArray(drawTexCoordLoc);
-        glVertexAttribPointer(drawTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
-        
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
-        
-        isFirstFrame = false;
-    } else {
-        glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[curr]);
-        glViewport(0, 0, width, height);
-        
-        glUseProgram(blendShaderProgram);
-
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, rawTexture);
-        glUniform1i(blendCurrentLoc, 0);
-
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, historyTextures[prev]);
-        glUniform1i(blendHistoryLoc, 1);
-
-        glUniform1f(blendFactorLoc, blur_strength);
-
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-
-        glEnableVertexAttribArray(blendPosLoc);
-        glVertexAttribPointer(blendPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
-        glEnableVertexAttribArray(blendTexCoordLoc);
-        glVertexAttribPointer(blendTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
-
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, width, height);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    glUseProgram(drawShaderProgram);
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, historyTextures[curr]);
-    glUniform1i(drawTextureLoc, 0);
-
-    glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-
-    glEnableVertexAttribArray(drawPosLoc);
-    glVertexAttribPointer(drawPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
-    glEnableVertexAttribArray(drawTexCoordLoc);
-    glVertexAttribPointer(drawTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
-
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
-
-    pingPongIndex = prev;
-}
-
+// --- 전역 변수 ---
 static bool g_initialized = false;
 static int g_width = 0, g_height = 0;
 static EGLContext g_targetcontext = EGL_NO_CONTEXT;
 static EGLSurface g_targetsurface = EGL_NO_SURFACE;
-static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
 
-struct WindowBounds {
-    float x, y, w, h;
-    bool visible;
-};
-static WindowBounds g_menuBounds = {0, 0, 0, 0, false};
-static std::mutex g_boundsMutex;
+static bool show_menu = false;
+static bool my_checkbox_state = false;
+static bool last_checkbox_state = false; // 상태 변화 감지용
 
+// --- 마인크래프트 오프셋 관련 변수 ---
+uintptr_t mcpe_base = 0;
+void* g_localPlayer = nullptr;
 
+// 함수 포인터 원형 선언
+void (*displayClientMessage)(void* _this, const std::string& msg) = nullptr;
+void (*orig_normalTick)(void* _this) = nullptr;
 
-
-void drawmenu() {
-    static bool show_menu = false;
-    static int current_tab = 0;
-
-    ImGuiIO& io = ImGui::GetIO();
-
-    
-    ImGui::SetNextWindowPos(ImVec2(0.0f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.0f, 0.5f)); // x=0, y=중앙, pivot=좌측중앙
-    ImGui::Begin("MenuTrigger", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoBackground);
-    
-    
-    ImGui::SetWindowFontScale(1.5f);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.1f, 0.1f, 0.1f, 0.8f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
-    if (ImGui::Button("OPEN MENU", ImVec2(200, 80))) { 
-        show_menu = !show_menu;
+// --- 라이브러리 베이스 주소 구하기 ---
+uintptr_t get_lib_base(const char* lib_name) {
+    FILE* fp = fopen("/proc/self/maps", "rt");
+    if (!fp) return 0;
+    char line[512];
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, lib_name)) {
+            // 실행 가능한 권한(r-xp)이 있는 메모리 영역을 주로 베이스로 잡습니다.
+            if (strstr(line, "r-xp") || strstr(line, "r--p")) {
+                sscanf(line, "%lx-", &base);
+                break;
+            }
+        }
     }
-    ImGui::PopStyleColor(2);
-    ImGui::SetWindowFontScale(1.0f); 
-    ImGui::End();
+    fclose(fp);
+    return base;
+}
 
-    if (show_menu) {
-        
-        ImGui::SetNextWindowSize(ImVec2(1000, 650), ImGuiCond_Appearing);
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.06f, 0.06f, 1.0f));
-
-        ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse;
-        ImGui::Begin("CustomUI_Main", &show_menu, window_flags);
-
-        ImVec2 win_pos = ImGui::GetWindowPos();
-        ImVec2 win_size = ImGui::GetWindowSize();
-        ImDrawList* draw_list = ImGui::GetWindowDrawList();
-
-        
-        float time = (float)ImGui::GetTime();
-        float r, g, b;
-        ImGui::ColorConvertHSVtoRGB(fmodf(time * 0.5f, 1.0f), 1.0f, 1.0f, r, g, b);
-        draw_list->AddRectFilled(win_pos, ImVec2(win_pos.x + win_size.x, win_pos.y + 5.0f), ImColor(r, g, b));
-
-        ImGui::SetCursorPosY(5.0f);
-
-        
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f, 0.04f, 0.04f, 1.0f));
-        ImGui::BeginChild("Sidebar", ImVec2(120, win_size.y - 5.0f), false);
-
-        for (int i = 0; i < 4; ++i) {
-            ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
-            ImVec2 center = ImVec2(cursor_pos.x + 60.0f, cursor_pos.y + 60.0f); // 중심점 이동
-            
-            if (current_tab == i) {
-                draw_list->AddRectFilled(cursor_pos, ImVec2(cursor_pos.x + 120.0f, cursor_pos.y + 120.0f), ImColor(0.12f, 0.12f, 0.12f, 1.0f));
-            }
-
-            if (ImGui::InvisibleButton((std::string("tab_") + std::to_string(i)).c_str(), ImVec2(120.0f, 120.0f))) {
-                current_tab = i;
-            }
-
-            ImU32 icon_color = (current_tab == i) ? ImColor(255, 255, 255) : ImColor(150, 150, 150);
-            float stroke_thick = 4.0f;
-            
-            
-            if (i == 0) {
-                draw_list->AddCircleFilled(ImVec2(center.x, center.y - 8), 12.0f, icon_color);
-                draw_list->PathArcTo(center, 22.0f, 0.0f, 3.14159f);
-                draw_list->PathStroke(icon_color, false, stroke_thick);
-            } else if (i == 1) {
-                draw_list->AddRectFilled(ImVec2(center.x - 12, center.y - 12), ImVec2(center.x + 12, center.y + 12), icon_color);
-                draw_list->AddRect(ImVec2(center.x - 20, center.y - 20), ImVec2(center.x + 20, center.y + 20), icon_color, 0.0f, 0, stroke_thick);
-            } else if (i == 2) {
-                draw_list->AddLine(ImVec2(center.x - 20, center.y - 20), ImVec2(center.x + 20, center.y + 20), icon_color, stroke_thick + 1.0f);
-                draw_list->AddLine(ImVec2(center.x + 20, center.y - 20), ImVec2(center.x - 20, center.y + 20), icon_color, stroke_thick + 1.0f);
-            } else if (i == 3) {
-                draw_list->AddLine(ImVec2(center.x - 20, center.y - 10), ImVec2(center.x + 20, center.y - 10), icon_color, stroke_thick);
-                draw_list->AddCircleFilled(ImVec2(center.x - 5, center.y - 10), 6.0f, icon_color);
-                draw_list->AddLine(ImVec2(center.x - 20, center.y + 10), ImVec2(center.x + 20, center.y + 10), icon_color, stroke_thick);
-                draw_list->AddCircleFilled(ImVec2(center.x + 8, center.y + 10), 6.0f, icon_color);
-            }
-        }
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
-
-        ImGui::SameLine(0, 0);
-
-        
-        ImGui::BeginChild("Content", ImVec2(win_size.x - 120.0f, win_size.y - 5.0f), false);
-        ImGui::SetCursorPos(ImVec2(40.0f, 40.0f));
-        
-        if (current_tab == 0) {
-            ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.2f, 0.8f, 0.4f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.15f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
-            
-            
-            ImGui::SetWindowFontScale(1.8f);
-        
-            ImGui::Checkbox("MOTION BLUR ON/OFF", &motion_blur_enabled);
-            
-            ImGui::Dummy(ImVec2(0.0f, 40.0f)); 
-            
-            ImGui::PushItemWidth(500.0f); 
-            ImGui::SliderFloat("BLUR STRENGTH", &blur_strength, 0.0f, 1.0f, "%.2f");
-            ImGui::PopItemWidth();
-
-            ImGui::SetWindowFontScale(1.0f); 
-            
-            ImGui::PopStyleColor(3);
-        } else {
-            ImGui::SetWindowFontScale(1.5f);
-            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Content for Tab %d", current_tab);
-            ImGui::SetWindowFontScale(1.0f);
-        }
-
-        ImGui::EndChild();
-        ImGui::End();
-        ImGui::PopStyleColor();
-        ImGui::PopStyleVar(2);
+// --- LocalPlayer::normalTick 후킹 함수 ---
+void hook_normalTick(void* _this) {
+    g_localPlayer = _this; // 플레이어 포인터 캡처
+    if (orig_normalTick) {
+        orig_normalTick(_this); // 원본 함수 실행
     }
 }
 
+// --- 원본 함수 포인터 (EGL & Input) ---
+static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
+static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
 
+// --- 입력 후킹 (ImGui 터치 처리) ---
+static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
+    int32_t result = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
+    if (result == 0 && event && *event && g_initialized) {
+        ImGui_ImplAndroid_HandleInputEvent(*event);
+    }
+    return result;
+}
 
+static void hookinput() {
+    void* hInput = dlopen("libinput.so", RTLD_LAZY);
+    if (hInput) {
+        void* sym = dlsym(hInput, "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE");
+        if (sym) {
+            DobbyHook(sym, (void*)hook_input2, (void**)&orig_input2);
+        }
+    }
+}
 
+// --- ImGui UI 그리기 ---
+static void draw_toggle_button() {
+    ImGui::SetNextWindowPos(ImVec2(50.0f, 50.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::Begin("##ToggleBtn", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize);
+    
+    ImGui::SetWindowFontScale(2.0f);
+    if (ImGui::Button(show_menu ? "Close" : "Menu", ImVec2(150, 80))) {
+        show_menu = !show_menu;
+    }
+    ImGui::End();
+}
+
+static void draw_menu() {
+    if (!show_menu) return;
+
+    ImGui::SetNextWindowPos(ImVec2(g_width * 0.5f, g_height * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    ImGui::Begin("Araxis Client", &show_menu, ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::SetWindowFontScale(2.0f);
+
+    // 체크박스 렌더링
+    ImGui::Checkbox("Test Module", &my_checkbox_state);
+    
+    // --- 체크박스 상태가 변했을 때의 로직 ---
+    if (my_checkbox_state != last_checkbox_state) {
+        last_checkbox_state = my_checkbox_state; // 상태 업데이트
+
+        // 플레이어가 월드에 접속해 있고, 함수가 정상적으로 바인딩 되었는지 확인
+        if (g_localPlayer != nullptr && displayClientMessage != nullptr) {
+            std::string msg;
+            if (my_checkbox_state) {
+                msg = "§a[Araxis] Test Module ON!"; // 초록색 텍스트
+            } else {
+                msg = "§c[Araxis] Test Module OFF!"; // 빨간색 텍스트
+            }
+            
+            // 캡처해둔 플레이어 포인터를 이용해 채팅창에 메시지 출력
+            displayClientMessage(g_localPlayer, msg);
+        }
+    }
+
+    ImGui::Separator();
+
+    // 메뉴 내부 텍스트 표시
+    if (my_checkbox_state) {
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "ON!");
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "OFF!");
+    }
+
+    ImGui::End();
+}
+
+// --- ImGui 초기화 및 렌더링 루프 ---
 static void setup() {
     if (g_initialized || g_width <= 0) return;
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    io.FontGlobalScale = 1.4f;
+    
     ImGui_ImplAndroid_Init();
     ImGui_ImplOpenGL3_Init("#version 300 es");
+    ImGui::StyleColorsDark();
     g_initialized = true;
 }
 
 static void render() {
     if (!g_initialized) return;
 
-    GLint last_active_texture; glGetIntegerv(GL_ACTIVE_TEXTURE, &last_active_texture);
-    glActiveTexture(GL_TEXTURE0);
-    GLint last_tex0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex0);
-    glActiveTexture(GL_TEXTURE1);
-    GLint last_tex1; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex1);
-    glActiveTexture(last_active_texture);
-
-    GLint last_prog; glGetIntegerv(GL_CURRENT_PROGRAM, &last_prog);
-    GLint last_array_buffer; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &last_array_buffer);
-    GLint last_element_array_buffer; glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &last_element_array_buffer);
-    GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
-    GLint last_viewport[4]; glGetIntegerv(GL_VIEWPORT, last_viewport);
-    GLboolean last_scissor = glIsEnabled(GL_SCISSOR_TEST);
-    GLboolean last_depth = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean last_blend = glIsEnabled(GL_BLEND);
-
-    if (motion_blur_enabled) {
-        apply_motion_blur(g_width, g_height);
-    }
+    GLint last_prog, last_tex, last_abuf, last_ebuf, last_fbo, last_vp[4];
+    GLboolean last_blend, last_depth, last_scissor;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &last_prog); glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &last_abuf); glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &last_ebuf);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo); glGetIntegerv(GL_VIEWPORT, last_vp);
+    last_blend = glIsEnabled(GL_BLEND); last_depth = glIsEnabled(GL_DEPTH_TEST); last_scissor = glIsEnabled(GL_SCISSOR_TEST);
 
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)g_width, (float)g_height);
+    
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame(g_width, g_height);
     ImGui::NewFrame();
     
-    drawmenu();
+    draw_toggle_button();
+    draw_menu();
     
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-    glUseProgram(last_prog);
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, last_tex0);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, last_tex1);
-    glActiveTexture(last_active_texture);
-
-    glBindBuffer(GL_ARRAY_BUFFER, last_array_buffer);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, last_element_array_buffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
-    glViewport(last_viewport[0], last_viewport[1], last_viewport[2], last_viewport[3]);
-    if (last_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
-    if (last_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    glUseProgram(last_prog); glBindTexture(GL_TEXTURE_2D, last_tex);
+    glBindBuffer(GL_ARRAY_BUFFER, last_abuf); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, last_ebuf);
+    glBindFramebuffer(GL_FRAMEBUFFER, last_fbo); glViewport(last_vp[0], last_vp[1], last_vp[2], last_vp[3]);
     if (last_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-
-    if (blendPosLoc >= 0) glDisableVertexAttribArray(blendPosLoc);
-    if (blendTexCoordLoc >= 0) glDisableVertexAttribArray(blendTexCoordLoc);
-    if (drawPosLoc >= 0) glDisableVertexAttribArray(drawPosLoc);
-    if (drawTexCoordLoc >= 0) glDisableVertexAttribArray(drawTexCoordLoc);
+    if (last_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (last_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
 }
 
+// --- EGL 후킹 ---
 static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     if (!orig_eglswapbuffers) return EGL_FALSE;
     EGLContext ctx = eglGetCurrentContext();
-    if (ctx == EGL_NO_CONTEXT || (g_targetcontext != EGL_NO_CONTEXT && (ctx != g_targetcontext || surf != g_targetsurface)))
-        return orig_eglswapbuffers(dpy, surf);
+    if (ctx == EGL_NO_CONTEXT) return orig_eglswapbuffers(dpy, surf);
     
     EGLint w, h;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
     if (w < 100 || h < 100) return orig_eglswapbuffers(dpy, surf);
-
-    if (g_targetcontext == EGL_NO_CONTEXT) { g_targetcontext = ctx; g_targetsurface = surf; }
-    g_width = w; g_height = h;
+    
+    if (g_targetcontext == EGL_NO_CONTEXT) { 
+        g_targetcontext = ctx; 
+        g_targetsurface = surf; 
+    }
+    if (ctx != g_targetcontext || surf != g_targetsurface) return orig_eglswapbuffers(dpy, surf);
+    
+    g_width = w; 
+    g_height = h;
     
     setup();
     render();
@@ -486,64 +208,37 @@ static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     return orig_eglswapbuffers(dpy, surf);
 }
 
-typedef bool (*PreloaderInput_OnTouch_Fn)(int action, int pointerId, float x, float y);
-
-struct PreloaderInput_Interface {
-    void (*RegisterTouchCallback)(PreloaderInput_OnTouch_Fn callback);
-};
-
-typedef PreloaderInput_Interface* (*GetPreloaderInput_Fn)();
-
-bool OnTouchCallback(int action, int pointerId, float x, float y) {
-    if (!g_initialized) return false;
-    
-    ImGuiIO& io = ImGui::GetIO();
-    io.AddMousePosEvent(x, y);
-    
-    if (action == AMOTION_EVENT_ACTION_DOWN) {
-        io.AddMouseButtonEvent(0, true);
-    } else if (action == AMOTION_EVENT_ACTION_UP) {
-        io.AddMouseButtonEvent(0, false);
-    }
-    
-    bool hitTest = false;
-    {
-        std::lock_guard<std::mutex> lock(g_boundsMutex);
-        if (g_menuBounds.visible) {
-            if (x >= g_menuBounds.x && x <= (g_menuBounds.x + g_menuBounds.w) &&
-                y >= g_menuBounds.y && y <= (g_menuBounds.y + g_menuBounds.h)) {
-                hitTest = true;
-            }
-        }
-    }
-    
-    return hitTest || io.WantCaptureMouse;
-}
-
+// --- 메인 쓰레드 초기화 ---
 static void* mainthread(void*) {
-    sleep(3);
-    GlossInit(true);
-    GHandle hegl = GlossOpen("libEGL.so");
-
-    if (hegl) {
-        void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
-        if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
+    // 라이브러리가 메모리에 확실히 올라올 때까지 대기
+    while (mcpe_base == 0) {
+        mcpe_base = get_lib_base("libminecraftpe.so");
+        if (mcpe_base == 0) sleep(1);
     }
+    
+    // 1. displayClientMessage 오프셋 바인딩 (0xA6B2C60)
+    displayClientMessage = (void(*)(void*, const std::string&))(mcpe_base + 0xA6B2C60);
 
-    void* preloaderLib = dlopen("libpreloader.so", RTLD_NOW);
-    if (preloaderLib) {
-        GetPreloaderInput_Fn GetInput = (GetPreloaderInput_Fn)dlsym(preloaderLib, "GetPreloaderInput");
-        if (GetInput) {
-            PreloaderInput_Interface* input = GetInput();
-            if (input && input->RegisterTouchCallback) {
-                input->RegisterTouchCallback(OnTouchCallback);
-            }
+    // 2. LocalPlayer::normalTick 후킹 (0xEC4E028)
+    void* tick_target = (void*)(mcpe_base + 0xEC4E028);
+    DobbyHook(tick_target, (void*)hook_normalTick, (void**)&orig_normalTick);
+
+    // 3. EGL 후킹 (화면 렌더링)
+    void* hEGL = dlopen("libEGL.so", RTLD_LAZY);
+    if (hEGL) {
+        void* swap = dlsym(hEGL, "eglSwapBuffers");
+        if (swap) {
+            DobbyHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
         }
     }
 
+    // 4. 입력 장치 후킹 (터치)
+    hookinput(); 
+    
     return nullptr;
 }
 
+// --- 생성자 진입점 ---
 __attribute__((constructor))
 void display_init() {
     pthread_t t;
